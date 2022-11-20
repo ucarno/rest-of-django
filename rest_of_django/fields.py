@@ -2,16 +2,14 @@ import inspect
 from decimal import Decimal
 from functools import cache
 from types import MappingProxyType
-from typing import Pattern, Iterable, TypeVar, Callable, Type, Any, Optional
+from typing import Pattern, Iterable, TypeVar, Callable, Any, Optional
 
 from django.core import validators as dj_validators
 from django.core.exceptions import ValidationError
 from django.db.models import Model
-
 from django.utils.translation import gettext_lazy as _
 
-import validators as _validators
-
+from rest_of_django.exceptions import SerializerError
 
 T = TypeVar('T')
 U = TypeVar('U')
@@ -20,11 +18,11 @@ T_DEFAULT = Optional[T | Callable[[], T]]
 T_VALUE_MSG = T | tuple[T, str]
 
 # todo: simplify regexes?
+T_REGEX = str | Pattern
 T_REGEXES = (
-    str |                                # non-compiled regex
-    Pattern |                            # compiled regex
-    Iterable[Pattern | str] |            # iterable of compiled or non-compiled regexes
-    Iterable[tuple[Pattern | str, str]]  # iterable of compiled or non-compiled regexes and their errors
+    T_REGEX,                            # compiled or non-compiled regex
+    Iterable[T_REGEX, ...] |            # iterable of compiled or non-compiled regexes
+    Iterable[tuple[T_REGEX, str], ...]  # iterable of compiled or non-compiled regexes and their errors
 )
 T_VALIDATORS = Iterable[Callable[[Any], Any]]
 T_DUNDER_CALL = Callable[[Optional[T]], None]
@@ -36,68 +34,45 @@ _UNDEFINED = object()
 _EMPTY_DICT = MappingProxyType({})
 
 
-def get_value_and_error(v: T_VALUE_MSG[T], default_error: str = None) -> tuple[T, str | None]:
-    if isinstance(v, Iterable) and not isinstance(v, str):
-        val = tuple(v)
-        val, error = val
-        return val, error or default_error
-    return v, default_error
+JSON_BASIC_TYPE = type[str | int | float | bool]
+JSON_TYPE = JSON_BASIC_TYPE | type[dict | list]
 
 
-def merge_serializer_errors(errors: list['SerializerError']):
-    errors_dict = {}
-    for err in errors:
-        errors_dict.update(err.parse_data())  # todo: warning or exception on conflicts
-    return SerializerError(errors_dict)
+def patch_validator_messages(validator, **messages):
+    """Patches validator's messages dict without modifying it globally"""
+    validator.messages = {**validator.messages, **messages}
+    return validator
 
 
-class SerializerError(ValidationError):
-    def __init__(self, data: dict, message: str = 'Serializer error.', code: str = 'serializer_error'):
-        super().__init__(message, code)
-        self.data = data
-
-    def parse_data(self, data: dict = None, only_first: bool = False, only_messages: bool = False) -> dict:
-        data = data if data else self.data
-
-        def errors_from_exception(error: ValidationError):
-            _errors = error.error_list[0:(1 if only_first else None)]
-            _errors_list = []
-            for e in _errors:
-                msg = e.message % (e.params or _EMPTY_DICT)
-                _errors_list.append(msg if only_messages else {'code': e.code, 'message': msg})
-            return _errors_list
-
-        errors = {}
-        for key, value in data.items():
-            if isinstance(value, SerializerError):
-                errors[key] = self.parse_data(value.data, only_first, only_messages)
-            else:
-                current_errors = sum([errors_from_exception(v) for v in value], [])
-                errors[key] = current_errors[0] if only_first else current_errors
-            continue
-        return errors
+def patch_validator(validator: dj_validators.BaseValidator, code: str = None):
+    """Patches validator's code"""
+    validator.code = code
+    return validator
 
 
-# todo: more elegant error definition
 class BaseField:
-    ERROR_NULL = _('Field value can not be null.')
-    ERROR_REQUIRED = _('This field is required.')
-    ERROR_READ_ONLY = _('This field is read only.')
-    ERROR_WRITE_ONLY = _('This field is write only')
-    ERROR_TYPE = _('Field is in incorrect type.')  # todo: add list of supported types
+    default_errors = {
+        'null_not_allowed': _('Field value can not be null.'),
+        'required': _('This field is required.'),
+        'read_only': _('This field is read only.'),
+        'write_only': _('This field is write only'),
+        'type': _('Incorrect type. Expected %(expected_type)s, but received %(received_type)s.'),
+    }
 
     def __init__(
             self, *, source: str = None, getter: str = None, setter: str = None, default: T_DEFAULT[Any] = _UNDEFINED,
             allow_null: bool = False, is_required: bool = True, is_snippet: bool = True,
-            read_only: bool = False, write_only: bool = False,
-            validators: Iterable[Callable[[Any], Any]] = None, json_type: Type | tuple[type, ...] = None
+            read_only: bool = False, write_only: bool = False, json_type: JSON_TYPE | tuple[JSON_TYPE, ...] = None,
+            validators: Iterable[Callable[[Any], Any]] = None, errors: dict = None
     ):
         assert not (source and (getter or setter)), "'source' can not be combined with 'getter' or 'setter'"
         assert not (write_only and read_only), "Field can not be 'write_only' and 'read_only' at the same time"
         assert not (read_only and is_required), "Field can not be 'read_only' and 'is_required' at the same time"
         assert not (write_only and is_snippet), "Field can not be 'write_only' and 'is_snippet' at the same time"
-        assert not (is_required and default != _UNDEFINED), "Field can not be 'is_required' and have a 'default' set"
+        assert not (is_required and default != _UNDEFINED), "Field can not be 'is_required' and have a 'default'"
         assert not (not allow_null and default is None), "'default' can not be 'None' if 'allow_null' is 'False'"
+
+        self.errors = {**self.default_errors, **(errors or {})}
 
         self.source = source  # acts as getter and setter at the same time
         self.getter = getter  # model field name to get value
@@ -106,7 +81,7 @@ class BaseField:
         # list of django validators
         self.validators: list[Callable[[Any], Any]] = list(validators) if validators else []
 
-        self.json_type: tuple[type] = json_type
+        self.json_type: tuple[JSON_TYPE] = json_type
         if self.json_type:
             self.json_type = (self.json_type,) if isinstance(self.json_type, type) else tuple(self.json_type)
 
@@ -121,47 +96,67 @@ class BaseField:
 
     @staticmethod
     def to_python(json_value):
-        """Prepares JSON data to be converted to Python"""
+        """
+        Converts JSON value to Python
+        :raises: ValidationError: if there is an error on conversion
+        """
         return json_value
 
     @staticmethod
     def to_json(python_value):
-        """Prepares Python data to be converted to JSON"""
+        """Converts Python value to JSON"""
         return python_value
 
-    def is_valid_field_base(self, value) -> None:
-        """Base validation of a field (type, 'allow_null', etc.)"""
+    def validate_field_base(self, value):
+        """
+        Validates raw value from parsed JSON and converts it to Python value for further validation
+        :raises: ValidationError: if raw field is invalid
+        :return: Converted Python value
+        """
         if value is None:
             if not self.allow_null:
-                raise ValidationError([ValidationError(message=self.ERROR_NULL, code='null_not_allowed')])
+                raise ValidationError(self.errors['null_not_allowed'], 'null_not_allowed')
             return
 
         if self.json_type and not isinstance(value, self.json_type):
-            raise ValidationError([ValidationError(message=self.ERROR_TYPE, code='wrong_type')])
+            raise ValidationError(self.errors['type'], 'type', {
+                'received_type': type(value).__name__,
+                'expected_type': ','.join([t.__name__ for t in self.json_type])
+            })
 
-    def is_valid_field(self, value) -> None:
-        """Validates a field"""
-        self.is_valid_field_base(value)
+        return self.to_python(value)
+
+    def validate_field(self, value):
+        """
+        Validates converted to python value
+        :raises: SerializerError: with list of exceptions if value is invalid
+        :return: Converted value
+        """
 
         errors = []
+        try:
+            converted = self.validate_field_base(value)
+        except ValidationError as e:
+            errors.append(e)
+            raise SerializerError(errors)
 
         for validator in self.validators:
             try:
-                validator(value)
+                validator(converted)
             except ValidationError as e:
                 errors.append(e)
 
-        if len(errors) > 0 and isinstance(errors[0], SerializerError):
-            if len(errors) == 1:
-                raise errors[0]
-            serializer_error = merge_serializer_errors([i for i in errors if isinstance(i, SerializerError)])
-            raise serializer_error
-        elif errors:
-            raise ValidationError(errors)
+        if len(errors) > 0:
+            raise SerializerError(errors)
+
+        return converted
 
 
 class Serializer(BaseField):
-    ERROR_FORBIDDEN_ELEMENTS = _('Mapping contains forbidden elements.')  # todo: specify which?
+    default_errors = {
+        **BaseField.default_errors,
+        'unexpected_keys': _('Object contains unexpected keys: %(unexpected_keys)s.')
+    }
 
     def __init__(self, *, instance: Model = None, data: dict = None, is_partial: bool = False, **kwargs):
         assert not (kwargs and instance), "You can not use a serializer as a field with passed 'instance' to it"
@@ -169,36 +164,55 @@ class Serializer(BaseField):
         assert not (data and is_partial), "It seems you wanted to partially validate data you passed as 'data' argument. " \
                                           "If so, 'is_partial' must be passed into `.validate` method"
 
+        kwargs.pop('json_type')
         super().__init__(json_type=dict, **kwargs)
-
-        self.is_partial = is_partial
 
         self.instance = instance
         self.data = data
 
-    def is_valid_field(self, value: dict, only_first: bool = False, is_partial: bool = False) -> None:
-        """Acts as a validator of a serializer as a field"""
-        self.is_valid_field_base(value)
+        self._validated_data = None
 
-        fields = self.get_fields()
+    @property
+    def validated_data(self) -> dict:
+        """
+        Converted data that is available only after validation
+        :raise: ValueError: if `is_valid() was not called earlier`
+        """
+        if not self._validated_data:
+            raise ValueError('This function can be called only after data is validated using `is_valid()` method.')
+        return self._validated_data
+
+    def validate_field(self, value: dict, is_partial: bool = False) -> dict:
+        """Validates serializer as a field"""
+        try:
+            value = self.validate_field_base(value)
+        except ValidationError as e:
+            raise SerializerError([e])
+
         errors = {}
+        converted = {}
 
-        for field_name, field in fields.items():
+        for field_name, field in self.get_fields():
             field: BaseField
 
             if field_name in value:
+                if field.read_only:
+                    errors[field_name] = SerializerError([
+                        ValidationError(message=field.errors['read_only'], code='read_only')
+                    ])
+
                 try:
-                    field.is_valid_field(value[field_name])
+                    converted[field_name] = field.validate_field(value[field_name])
                 except SerializerError as error:
                     errors[field_name] = error
-                except ValidationError as error:
-                    errors[field_name] = errors.get(field_name, []) + [error]
             else:
-                if field.is_required and not is_partial:
-                    errors[field_name] = errors.get(field_name, []) + [ValidationError(field.ERROR_REQUIRED)]
+                if field.is_required and not is_partial and not field.read_only:
+                    errors[field_name] = errors.get(field_name, []) + [ValidationError(field.errors['required'])]
 
         if errors:
             raise SerializerError(errors)
+
+        return converted
 
     def is_valid(self, *, is_partial: bool = False, raise_error: bool = False) -> bool:
         """Validates a serializer"""
@@ -206,9 +220,9 @@ class Serializer(BaseField):
             raise ValueError("Could not validate, because 'data' was not provided")
 
         try:
-            self.is_valid_field(self.data, is_partial=is_partial)
+            self.validate_field(self.data, is_partial=is_partial)
             return True
-        except ValidationError as e:
+        except SerializerError as e:
             if raise_error:
                 raise e
             return False
@@ -241,6 +255,13 @@ class BooleanField(BaseField):
 
 
 class CharField(BaseField):
+    default_errors = {
+        **BaseField.default_errors,
+        'min_length': _('Value must be at least %(min_length)s characters long.'),
+        'max_length': _('Value can not exceed %(max_length)s characters.'),
+        'invalid': _('Invalid value.')
+    }
+
     def __init__(
             self, *, min_length: int = None, max_length: int = None, regexes: T_REGEXES = None,
             default: T_DEFAULT[str] = _UNDEFINED, **kwargs
@@ -255,22 +276,50 @@ class CharField(BaseField):
             assert self.min_length <= self.max_length, "'max_length' must be greater or equal to 'min_length'"
 
         if self.min_length:
-            self.validators.append(dj_validators.MinLengthValidator(min_length))
+            self.validators.append(dj_validators.MinLengthValidator(min_length, self.errors['min_length']))
         if self.max_length:
-            self.validators.append(dj_validators.MaxLengthValidator(max_length))
+            self.validators.append(dj_validators.MaxLengthValidator(max_length, self.errors['max_length']))
 
         if regexes:
-            if isinstance(regexes, str):
-                regexes_and_errors = get_value_and_error(regexes),
+            if isinstance(regexes, (str, Pattern)):
+                self.validators.append(dj_validators.RegexValidator(
+                    regexes,
+                    message=self.errors['regex'],
+                    code='regex',
+                ))
             else:
-                vals = tuple(get_value_and_error(val) for val in regexes)
-                regexes_and_errors = vals
+                regexes = tuple(regexes)
+                if len(regexes) == 0:
+                    return
 
-            for regex, error in regexes_and_errors:
-                self.validators.append(dj_validators.RegexValidator(regex, error))
+                for r in regexes:
+                    regex, error = r, self.errors['regex'] if isinstance(r, (str, Pattern)) else r
+                    if not error:
+                        error = self.errors['regex']
+
+                    self.validators.append(dj_validators.RegexValidator(
+                        regexes,
+                        message=error,
+                        code='invalid',
+                    ))
+
+    # value and error in regexes
+    @classmethod
+    def get_value_and_error(cls, v: T_VALUE_MSG[T], default_error: str = None) -> tuple[T, str | None]:
+        if isinstance(v, Iterable) and not isinstance(v, str):
+            val = tuple(v)
+            val, error = val
+            return val, error or default_error
+        return v, default_error
 
 
 class NumericField(BaseField):
+    default_errors = {
+        **BaseField.default_errors,
+        'min_value': dj_validators.MinValueValidator.message,
+        'max_value': dj_validators.MaxValueValidator.message,
+    }
+
     def __init__(
             self, *, min_value: int = None, max_value: int = None,
             default: T_DEFAULT[int] = _UNDEFINED, **kwargs
@@ -285,9 +334,9 @@ class NumericField(BaseField):
             assert self.min_value <= self.max_value, "'max_value' must be greater or equal to 'min_value'"
 
         if self.min_value:
-            self.validators.append(dj_validators.MinValueValidator(min_value))
+            self.validators.append(dj_validators.MinValueValidator(min_value, self.errors['min_value']))
         if self.max_value:
-            self.validators.append(dj_validators.MaxValueValidator(max_value))
+            self.validators.append(dj_validators.MaxValueValidator(max_value, self.errors['max_value']))
 
 
 class IntegerField(NumericField):
@@ -303,20 +352,37 @@ class FloatField(NumericField):
 
 
 class DecimalField(NumericField):
+    errors = {
+        **NumericField.default_errors,
+        'max_digits': dj_validators.DecimalValidator.messages['max_digits'],
+        'max_decimal_places': dj_validators.DecimalValidator.messages['max_decimal_places'],
+        'max_whole_digits': dj_validators.DecimalValidator.messages['max_whole_digits']
+    }
+
     def __init__(
-            self, *, max_digits: int = None, decimal_places: int = None,
+            self, *, max_digits: int = None, max_decimal_places: int = None,
             default: T_DEFAULT[Decimal] = _UNDEFINED, **kwargs
     ):
-        super().__init__(**kwargs, json_type=float, default=default)  # todo: cast float into decimal
+        super().__init__(**kwargs, json_type=float, default=default)
 
         self.max_digits = max_digits
-        self.decimal_places = decimal_places
+        self.max_decimal_places = max_decimal_places
 
-        if self.max_digits or self.decimal_places:
-            self.validators.append(dj_validators.DecimalValidator(self.max_digits, self.decimal_places))
+        if self.max_digits or self.max_decimal_places:
+            assert self.max_digits and self.max_decimal_places, \
+                "'max_digits' and 'max_decimal_places' should be defined both or not defined at all."
+            validator = dj_validators.DecimalValidator(self.max_digits, self.max_decimal_places)
+            patch_validator_messages(
+                validator,
+                max_digits=self.errors['max_digits'],
+                max_decimal_places=self.errors['max_decimal_places'],
+                max_whole_digits=self.errors['max_whole_digits']
+            )
+
+            self.validators.append(dj_validators.DecimalValidator(self.max_digits, self.max_decimal_places))
 
     @staticmethod
-    def to_json(python_value: Decimal):
+    def to_json(python_value: Decimal) -> float:
         return float(python_value)
 
     @staticmethod
@@ -325,6 +391,12 @@ class DecimalField(NumericField):
 
 
 class DictField(BaseField):
+    default_errors = {
+        **BaseField.default_errors,
+        'min_items': _('Object does not contain enough items, minimum item count is %(limit_value)d.'),
+        'max_items': _('Object contains too many items, maximum item count is %(limit_value)d.'),
+    }
+
     def __init__(
             self, *, min_items: int, max_items: int, key_field: CharField = None, value_field: BaseField = None,
             default: T_DEFAULT[dict] = _UNDEFINED, **kwargs
@@ -339,47 +411,152 @@ class DictField(BaseField):
             assert self.min_items <= self.max_items, "'max_items' must be greater or equal to 'min_items'"
 
         if self.min_items:
-            self.validators.append(dj_validators.MinLengthValidator(self.min_items))  # todo: correct error
+            self.validators.append(patch_validator(
+                dj_validators.MinLengthValidator(self.min_items, self.errors['min_items']),
+                code='min_items'
+            ))
         if self.max_items:
-            self.validators.append(dj_validators.MaxLengthValidator(self.max_items))  # todo: correct error
+            self.validators.append(patch_validator(
+                dj_validators.MaxLengthValidator(self.max_items, self.errors['max_items']),
+                code='max_items'
+            ))
 
         self.key_field = key_field
         self.value_field = value_field
 
-        if self.key_field:
-            assert not self.key_field.allow_null, "Dict keys can not be 'None', please edit 'allow_null' argument"
-            self.validators.append(_validators.DictFieldKeyValidator(self.key_field))
+        assert not (self.key_field and self.key_field.allow_null), \
+            "Dict keys can not be null, edit 'allow_null' argument"
 
-        if self.value_field:
-            self.validators.append(_validators.DictFieldValueValidator(self.value_field))
+    def validate_field(self, value: dict) -> dict:
+        """Validates dict field"""
+        try:
+            value: dict = self.validate_field_base(value)
+        except ValidationError as e:
+            raise SerializerError([e])
+
+        errors = {}
+        converted = {}
+
+        for item_key, item_value in value.items():
+            converted_key = None
+            converted_value = _UNDEFINED
+
+            if self.key_field:
+                try:
+                    converted_key = self.key_field.validate_field(item_key)
+                except SerializerError as e:
+                    errors[f'{item_key}:key'] = e
+            else:
+                converted_key = item_key
+
+            if self.value_field:
+                try:
+                    converted_value = self.value_field.validate_field(item_value)
+                except SerializerError as e:
+                    errors[item_key] = e
+            else:
+                converted_value = item_value
+
+            if converted_key and converted_value != _UNDEFINED:
+                converted[converted_key] = converted_value
+
+        if errors:
+            raise SerializerError(errors)
+
+        errors = []
+        for validator in self.validators:
+            try:
+                validator(value)
+            except ValidationError as e:
+                errors.append(e)
+
+        if errors:
+            raise SerializerError(errors)
+
+        return converted
 
 
 class ListField(BaseField):
+    default_errors = {
+        **BaseField.default_errors,
+        'unique_items': _('Array values must be unique.'),
+        'min_length': _('Array should contain at least %(limit_value)d values.'),
+        'max_length': _('Array should not contain more than %(limit_value)d values.'),
+    }
+
     def __init__(
             self, *, min_length=None, max_length=None, unique_items=False, item_field: BaseField = None,
+            item_json_type: JSON_BASIC_TYPE | tuple[JSON_BASIC_TYPE, ...],
             default: T_DEFAULT[list | tuple] = _UNDEFINED, **kwargs
     ):
         super().__init__(**kwargs, json_type=list, default=default)
         self.default: T_DEFAULT[list | tuple]
 
-        self.min_length: Optional[int]
-        self.max_length: Optional[int]
-        self.unique_items: bool
+        assert not (unique_items and isinstance(item_field, (ListField, DictField, Serializer))), \
+            f"Can not combine 'unique_items' with 'item_field={item_field.__class__.__name__}', " \
+            f"because type of an item field must be hashable"
+        assert not (item_field and item_json_type), "'item_field' can not be combined with 'item_json_type'"
 
-        self.min_length = min_length
-        self.max_length = max_length
-        self.unique_items = unique_items
+        self.min_length: Optional[int] = min_length
+        self.max_length: Optional[int] = max_length
+        self.unique_items: bool = unique_items
+
+        self.item_json_type = item_json_type
+        self.item_field = item_field
 
         if self.min_length and self.max_length:
             assert self.min_length <= self.max_length, "'max_length' must be greater or equal to 'min_length'"
 
         if self.min_length:
-            self.validators.append(dj_validators.MinLengthValidator(self.min_length))  # todo: correct error
+            self.validators.append(dj_validators.MinLengthValidator(self.min_length, self.errors['min_length']))
         if self.max_length:
-            self.validators.append(dj_validators.MaxLengthValidator(self.max_length))  # todo: correct error
-        if self.unique_items:
-            self.validators.append(_validators.UniqueItemsValidator())
+            self.validators.append(dj_validators.MaxLengthValidator(self.max_length, self.errors['max_length']))
 
-        self.item_field = item_field
+    def validate_field(self, value: list) -> list:
+        """Validates dict field"""
+        try:
+            value: list = self.validate_field_base(value)
+        except ValidationError as e:
+            raise SerializerError([e])
+
+        if self.unique_items:
+            try:
+                is_unique = len(value) == len(list(value))
+            except TypeError:
+                is_unique = False
+
+            if not is_unique:
+                raise SerializerError([ValidationError(self.errors['unique_items'], code='unique_items')])
+
+        errors = {}
+        converted = []
+
+        item_field = None
         if self.item_field:
-            self.validators.append(_validators.ListFieldItemValidator(self.item_field))
+            item_field = self.item_field
+        elif self.item_json_type:
+            item_field = BaseField(json_type=self.item_json_type)
+
+        if item_field:
+            for index, item in enumerate(value):
+                try:
+                    converted.append(item_field.validate_field(item))
+                except SerializerError as e:
+                    errors[str(index)] = e
+
+            if errors:
+                raise SerializerError(errors)
+        else:
+            converted = value
+
+        errors = []
+        for validator in self.validators:
+            try:
+                validator(value)
+            except ValidationError as e:
+                errors.append(e)
+
+        if errors:
+            raise SerializerError(errors)
+
+        return converted

@@ -27,7 +27,8 @@ class Dog(Cat):
 
 
 if __name__ == '__main__':
-    try:
-        Dog(data={'cat': {'test': '1111', 'test1': 21, 'owl': {'test222': '1111111', 'test2222': 32432, 'kala': 3}, 'l': ''}}).is_valid(raise_error=True)
-    except SerializerError as e:
-        print(e.parse_data(only_messages=False, only_first=False))
+    pass
+    # try:
+    #     Dog(data={'cat': {'test': '1111', 'test1': 21, 'owl': {'test222': '1111111', 'test2222': 32432, 'kala': 3}, 'l': ''}}).is_valid(raise_error=True)
+    # except SerializerError as e:
+    #     print(e.parse_data(only_messages=False, only_first=False))
