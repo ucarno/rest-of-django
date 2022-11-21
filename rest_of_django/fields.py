@@ -4,6 +4,7 @@ from functools import cache
 from types import MappingProxyType
 from typing import Pattern, Iterable, TypeVar, Callable, Any, Optional
 
+from django.conf import settings
 from django.core import validators as dj_validators
 from django.core.exceptions import ValidationError
 from django.db.models import Model
@@ -15,14 +16,12 @@ T = TypeVar('T')
 U = TypeVar('U')
 
 T_DEFAULT = Optional[T | Callable[[], T]]
-T_VALUE_MSG = T | tuple[T, str]
 
-# todo: simplify regexes?
 T_REGEX = str | Pattern
 T_REGEXES = (
-    T_REGEX,                            # compiled or non-compiled regex
-    Iterable[T_REGEX, ...] |            # iterable of compiled or non-compiled regexes
-    Iterable[tuple[T_REGEX, str], ...]  # iterable of compiled or non-compiled regexes and their errors
+    T_REGEX,                                           # compiled or non-compiled regex
+    Iterable[T_REGEX] |                                # iterable of compiled or non-compiled regexes
+    Iterable[tuple[T_REGEX, Optional[str]] | T_REGEX]  # iterable of compiled or non-compiled regexes and their errors
 )
 T_VALIDATORS = Iterable[Callable[[Any], Any]]
 T_DUNDER_CALL = Callable[[Optional[T]], None]
@@ -34,8 +33,8 @@ _UNDEFINED = object()
 _EMPTY_DICT = MappingProxyType({})
 
 
-JSON_BASIC_TYPE = type[str | int | float | bool]
-JSON_TYPE = JSON_BASIC_TYPE | type[dict | list]
+T_JSON_BASIC = type[str | int | float | bool]
+T_JSON = T_JSON_BASIC | type[dict | list]
 
 
 def patch_validator_messages(validator, **messages):
@@ -56,40 +55,53 @@ class BaseField:
         'required': _('This field is required.'),
         'read_only': _('This field is read only.'),
         'write_only': _('This field is write only'),
-        'type': _('Incorrect type. Expected %(expected_type)s, but received %(received_type)s.'),
+        'type': _('Incorrect type. Expected \'%(expected_type)s\', but got \'%(received_type)s\'.'),
     }
 
     def __init__(
             self, *, source: str = None, getter: str = None, setter: str = None, default: T_DEFAULT[Any] = _UNDEFINED,
-            allow_null: bool = False, is_required: bool = True, is_snippet: bool = True,
-            read_only: bool = False, write_only: bool = False, json_type: JSON_TYPE | tuple[JSON_TYPE, ...] = None,
+            allow_null: bool = False, required: bool = True, snippet: bool = True,
+            read_only: bool = False, write_only: bool = False, json_type: T_JSON | tuple[T_JSON, ...] = None,
             validators: Iterable[Callable[[Any], Any]] = None, errors: dict = None
     ):
+        """
+        :param source: field name in a Django model
+        :param getter: property or a method in a Django model to retrieve field value
+        :param setter: method in a Django model to set data
+        :param default: any value or a method, which takes no arguments and returns a value
+        :param allow_null: whether this field can be `null`
+        :param required: whether this field must be provided
+        :param snippet: whether this field must be included by default in GET requests
+        :param read_only: whether this field is for read only
+        :param write_only: whether this field is for write only
+        :param json_type: expected type or types parsed from JSON string
+        :param validators: list of validators
+        :param errors: error messages' overwrites
+        """
+
         assert not (source and (getter or setter)), "'source' can not be combined with 'getter' or 'setter'"
         assert not (write_only and read_only), "Field can not be 'write_only' and 'read_only' at the same time"
-        assert not (read_only and is_required), "Field can not be 'read_only' and 'is_required' at the same time"
-        assert not (write_only and is_snippet), "Field can not be 'write_only' and 'is_snippet' at the same time"
-        assert not (is_required and default != _UNDEFINED), "Field can not be 'is_required' and have a 'default'"
+        assert not (read_only and required), "Field can not be 'read_only' and 'required' at the same time"
+        assert not (write_only and snippet), "Field can not be 'write_only' and 'snippet' at the same time"
+        assert not (required and default != _UNDEFINED), "Field can not be 'required' and have a 'default'"
         assert not (not allow_null and default is None), "'default' can not be 'None' if 'allow_null' is 'False'"
 
         self.errors = {**self.default_errors, **(errors or {})}
 
         self.source = source  # acts as getter and setter at the same time
-        self.getter = getter  # model field name to get value
-        self.setter = setter  # model field name to store value
 
         # list of django validators
         self.validators: list[Callable[[Any], Any]] = list(validators) if validators else []
 
-        self.json_type: tuple[JSON_TYPE] = json_type
+        self.json_type: tuple[T_JSON] = json_type
         if self.json_type:
             self.json_type = (self.json_type,) if isinstance(self.json_type, type) else tuple(self.json_type)
 
         self.allow_null = allow_null
-        self.is_required = is_required
+        self.required = required
         self.read_only = read_only
         self.write_only = write_only
-        self.is_snippet = is_snippet
+        self.snippet = snippet
 
         # default value, can be a function with no mandatory arguments
         self.default: T_DEFAULT[Any] = default
@@ -121,7 +133,7 @@ class BaseField:
         if self.json_type and not isinstance(value, self.json_type):
             raise ValidationError(self.errors['type'], 'type', {
                 'received_type': type(value).__name__,
-                'expected_type': ','.join([t.__name__ for t in self.json_type])
+                'expected_type': ' | '.join([t.__name__ for t in self.json_type])
             })
 
         return self.to_python(value)
@@ -145,6 +157,8 @@ class BaseField:
                 validator(converted)
             except ValidationError as e:
                 errors.append(e)
+                if settings.ROD_ONLY_FIRST:
+                    break
 
         if len(errors) > 0:
             raise SerializerError(errors)
@@ -159,12 +173,16 @@ class Serializer(BaseField):
     }
 
     def __init__(self, *, instance: Model = None, data: dict = None, is_partial: bool = False, **kwargs):
+        """
+        :param instance: Instance of a Django model
+        :param is_partial: Specifies partial validation (e.g. for PATCH request)
+        """
         assert not (kwargs and instance), "You can not use a serializer as a field with passed 'instance' to it"
         assert not (kwargs and data is not None), "You can not use a serializer as a field with passed 'data' to it"
         assert not (data and is_partial), "It seems you wanted to partially validate data you passed as 'data' argument. " \
                                           "If so, 'is_partial' must be passed into `.validate` method"
 
-        kwargs.pop('json_type')
+        kwargs.pop('json_type', None)
         super().__init__(json_type=dict, **kwargs)
 
         self.instance = instance
@@ -192,7 +210,7 @@ class Serializer(BaseField):
         errors = {}
         converted = {}
 
-        for field_name, field in self.get_fields():
+        for field_name, field in self.get_fields().items():
             field: BaseField
 
             if field_name in value:
@@ -206,8 +224,10 @@ class Serializer(BaseField):
                 except SerializerError as error:
                     errors[field_name] = error
             else:
-                if field.is_required and not is_partial and not field.read_only:
-                    errors[field_name] = errors.get(field_name, []) + [ValidationError(field.errors['required'])]
+                if field.default:
+                    converted[field_name] = field.default() if callable(field.default) else field.default
+                elif field.required and not is_partial and not field.read_only:
+                    errors[field_name] = SerializerError([ValidationError(field.errors['required'])])
 
         if errors:
             raise SerializerError(errors)
@@ -238,14 +258,14 @@ class Serializer(BaseField):
     def get_required_fields(cls) -> set[str]:
         """Returns a set of required field names"""
         fields = cls.get_fields()
-        required_fields = {k for k, v in fields.items() if v.is_required}
+        required_fields = {k for k, v in fields.items() if v.required}
         return required_fields
 
     @classmethod
     def get_snippet_fields(cls) -> set[str]:
         """Returns a set of snippet field names"""
         fields = cls.get_fields()
-        snippet_fields = {k for k, v in fields.items() if v.is_snippet}
+        snippet_fields = {k for k, v in fields.items() if v.snippet}
         return snippet_fields
 
 
@@ -266,6 +286,14 @@ class CharField(BaseField):
             self, *, min_length: int = None, max_length: int = None, regexes: T_REGEXES = None,
             default: T_DEFAULT[str] = _UNDEFINED, **kwargs
     ):
+        """
+        :param min_length: minimum length of a string
+        :param max_length: maximum length of a string
+        :param regexes: single regular expression or list of regular expressions in form of [re1, re2, ...] or [(re1, error1), (re2, error2), ...]
+        :param default:
+        :param kwargs:
+        """
+
         super().__init__(**kwargs, json_type=str, default=default)
         self.default: T_DEFAULT[str]
 
@@ -293,24 +321,15 @@ class CharField(BaseField):
                     return
 
                 for r in regexes:
-                    regex, error = r, self.errors['regex'] if isinstance(r, (str, Pattern)) else r
+                    regex, error = (r, self.errors['regex']) if isinstance(r, (str, Pattern)) else r
                     if not error:
                         error = self.errors['regex']
 
                     self.validators.append(dj_validators.RegexValidator(
-                        regexes,
+                        regex,
                         message=error,
                         code='invalid',
                     ))
-
-    # value and error in regexes
-    @classmethod
-    def get_value_and_error(cls, v: T_VALUE_MSG[T], default_error: str = None) -> tuple[T, str | None]:
-        if isinstance(v, Iterable) and not isinstance(v, str):
-            val = tuple(v)
-            val, error = val
-            return val, error or default_error
-        return v, default_error
 
 
 class NumericField(BaseField):
@@ -399,10 +418,13 @@ class DictField(BaseField):
 
     def __init__(
             self, *, min_items: int, max_items: int, key_field: CharField = None, value_field: BaseField = None,
+            value_json_type: T_JSON | tuple[T_JSON, ...],
             default: T_DEFAULT[dict] = _UNDEFINED, **kwargs
     ):
         super().__init__(**kwargs, json_type=dict, default=default)
         self.default: T_DEFAULT[dict]
+
+        assert not (value_field and value_json_type), "'value_field' can not be combined with 'value_json_type'"
 
         self.min_items = min_items
         self.max_items = max_items
@@ -424,11 +446,17 @@ class DictField(BaseField):
         self.key_field = key_field
         self.value_field = value_field
 
+        if value_json_type:
+            self.value_field = BaseField(json_type=value_json_type)
+
         assert not (self.key_field and self.key_field.allow_null), \
             "Dict keys can not be null, edit 'allow_null' argument"
 
     def validate_field(self, value: dict) -> dict:
-        """Validates dict field"""
+        """
+        Validates dict field
+        :raise SerializerError:
+        """
         try:
             value: dict = self.validate_field_base(value)
         except ValidationError as e:
@@ -469,6 +497,8 @@ class DictField(BaseField):
                 validator(value)
             except ValidationError as e:
                 errors.append(e)
+                if settings.ROD_ONLY_FIRST:
+                    break
 
         if errors:
             raise SerializerError(errors)
@@ -486,7 +516,7 @@ class ListField(BaseField):
 
     def __init__(
             self, *, min_length=None, max_length=None, unique_items=False, item_field: BaseField = None,
-            item_json_type: JSON_BASIC_TYPE | tuple[JSON_BASIC_TYPE, ...],
+            item_json_type: T_JSON_BASIC | tuple[T_JSON_BASIC, ...] = None,
             default: T_DEFAULT[list | tuple] = _UNDEFINED, **kwargs
     ):
         super().__init__(**kwargs, json_type=list, default=default)
@@ -501,8 +531,9 @@ class ListField(BaseField):
         self.max_length: Optional[int] = max_length
         self.unique_items: bool = unique_items
 
-        self.item_json_type = item_json_type
         self.item_field = item_field
+        if item_json_type:
+            self.item_field = BaseField(json_type=item_json_type)
 
         if self.min_length and self.max_length:
             assert self.min_length <= self.max_length, "'max_length' must be greater or equal to 'min_length'"
@@ -513,7 +544,10 @@ class ListField(BaseField):
             self.validators.append(dj_validators.MaxLengthValidator(self.max_length, self.errors['max_length']))
 
     def validate_field(self, value: list) -> list:
-        """Validates dict field"""
+        """
+        Validates list field
+        :raise SerializerError:
+        """
         try:
             value: list = self.validate_field_base(value)
         except ValidationError as e:
@@ -531,16 +565,10 @@ class ListField(BaseField):
         errors = {}
         converted = []
 
-        item_field = None
         if self.item_field:
-            item_field = self.item_field
-        elif self.item_json_type:
-            item_field = BaseField(json_type=self.item_json_type)
-
-        if item_field:
             for index, item in enumerate(value):
                 try:
-                    converted.append(item_field.validate_field(item))
+                    converted.append(self.item_field.validate_field(item))
                 except SerializerError as e:
                     errors[str(index)] = e
 
@@ -555,6 +583,8 @@ class ListField(BaseField):
                 validator(value)
             except ValidationError as e:
                 errors.append(e)
+                if settings.ROD_FIRST_ONLY:
+                    break
 
         if errors:
             raise SerializerError(errors)
