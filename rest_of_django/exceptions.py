@@ -6,21 +6,27 @@ from django.core.exceptions import ValidationError
 
 def _format_error(error: ValidationError):
     if settings.ROD_FORMAT == 'code':
-        return error.code
+        return error.code or 'invalid'
 
     elif settings.ROD_FORMAT == 'message':
         return error.message % (error.params or {})
 
     else:
-        return {'code': error.code, 'message': error.message % (error.params or {})}
+        return {'code': error.code or 'invalid', 'message': error.message % (error.params or {})}
 
 
 class SerializerError(Exception):
-    def __init__(self, exceptions: list[Union['SerializerError', ValidationError], ...] | dict[str, 'SerializerError'] = None):
+    def __init__(self, exceptions: list[Union['SerializerError', ValidationError], ...] | dict[str, 'SerializerError'] | ValidationError = None):
         self.exceptions = exceptions
 
     def __str__(self):
-        return f'SerializerError<{self.parse()}>'
+        return f'SerializerError<{self.parse_base()}>'
+
+    def parse_base(self):
+        if isinstance(self.exceptions, ValidationError):
+            return {'base': _format_error(self.exceptions)}
+        else:
+            return {'fields': self.parse()}
 
     def parse(self) -> dict | list:
         if isinstance(self.exceptions, list):

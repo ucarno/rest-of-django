@@ -1,6 +1,6 @@
 import inspect
+from abc import abstractmethod
 from decimal import Decimal
-from functools import cache
 from types import MappingProxyType
 from typing import Pattern, Iterable, TypeVar, Callable, Any, Optional
 
@@ -200,12 +200,14 @@ class Serializer(BaseField):
             raise ValueError('This function can be called only after data is validated using `is_valid()` method.')
         return self._validated_data
 
-    def validate_field(self, value: dict, is_partial: bool = False) -> dict:
+    def validate_field(self, value: dict, is_partial: bool = False, context: dict = None) -> dict:
         """Validates serializer as a field"""
         try:
             value = self.validate_field_base(value)
         except ValidationError as e:
             raise SerializerError([e])
+
+        contextual_validators = self.get_contextual_validators()
 
         errors = {}
         converted = {}
@@ -218,11 +220,32 @@ class Serializer(BaseField):
                     errors[field_name] = SerializerError([
                         ValidationError(message=field.errors['read_only'], code='read_only')
                     ])
+                    continue
 
                 try:
-                    converted[field_name] = field.validate_field(value[field_name])
+                    kwargs = {'value': value[field_name]}
+                    if isinstance(field, Serializer):
+                        kwargs['context'] = context
+                    converted[field_name] = field.validate_field(**kwargs)
                 except SerializerError as error:
                     errors[field_name] = error
+                    continue
+
+                if field_name in contextual_validators:
+                    validator = contextual_validators[field_name]
+                    args = set(inspect.signature(validator).parameters.keys())
+                    is_static = isinstance(inspect.getattr_static(self, f'validate_{field_name}'), staticmethod)
+                    requires_context = (len(args) > 2) if is_static else (len(args) > 1)
+
+                    try:
+                        if requires_context:
+                            validator(converted[field_name], context or {})
+                        else:
+                            validator(converted[field_name])
+                    except ValidationError as e:
+                        converted.pop(field_name, None)
+                        errors[field_name] = SerializerError([e])
+
             else:
                 if field.default:
                     converted[field_name] = field.default() if callable(field.default) else field.default
@@ -232,23 +255,34 @@ class Serializer(BaseField):
         if errors:
             raise SerializerError(errors)
 
+        validate_together = getattr(self, 'validate')
+        if not getattr(validate_together, '__isabstractmethod__', False):
+            try:
+                validate_together(data=converted, is_partial=is_partial, context=context)
+            except ValidationError as e:
+                raise SerializerError(e)
+
         return converted
 
-    def is_valid(self, *, is_partial: bool = False, raise_error: bool = False) -> bool:
+    def is_valid(self, *, is_partial: bool = False, raise_error: bool = False, context: dict = None) -> bool:
         """Validates a serializer"""
         if self.data is None:
             raise ValueError("Could not validate, because 'data' was not provided")
 
         try:
-            self.validate_field(self.data, is_partial=is_partial)
+            self.validate_field(self.data, is_partial=is_partial, context=context)
             return True
         except SerializerError as e:
             if raise_error:
                 raise e
             return False
 
+    @abstractmethod
+    def validate(self, data: dict, is_partial: bool, context: dict):
+        raise NotImplementedError(f"'validate' method is not implemented in '{self.__class__.__name__}' class.")
+
     @classmethod
-    @cache
+    # @cache
     def get_fields(cls) -> MappingProxyType[str, BaseField]:
         """Returns an immutable dict of fields in form of {field_name: Field}"""
         fields = inspect.getmembers(cls, lambda x: not inspect.isroutine(x) and isinstance(x, BaseField))
@@ -267,6 +301,20 @@ class Serializer(BaseField):
         fields = cls.get_fields()
         snippet_fields = {k for k, v in fields.items() if v.snippet}
         return snippet_fields
+
+    @classmethod
+    def get_contextual_validators(cls) -> dict[str, Callable[[Any, dict], None] | Callable[[Any], None]]:
+        fields = cls.get_fields()
+
+        validators = {}
+        for field_name in fields.keys():
+            validator_name = f'validate_{field_name}'
+            if hasattr(cls, validator_name):
+                validator = getattr(cls, validator_name)
+                if callable(validator):
+                    validators[field_name] = validator
+
+        return validators
 
 
 class BooleanField(BaseField):
