@@ -1,21 +1,30 @@
 import inspect
+import re
 from abc import abstractmethod
+import datetime
 from decimal import Decimal
 from types import MappingProxyType
 from typing import Pattern, Iterable, TypeVar, Callable, Any, Optional
+from uuid import UUID
 
 from django.conf import settings
 from django.core import validators as dj_validators
 from django.core.exceptions import ValidationError
+from django.core.validators import EmailValidator, URLValidator, MinValueValidator, MaxValueValidator
 from django.db.models import Model
+from django.utils.dateparse import parse_date, parse_time, parse_datetime, parse_duration
 from django.utils.translation import gettext_lazy as _
 
 from rest_of_django.exceptions import SerializerError
+from rest_of_django.utils import timedelta_to_iso8601
+from rest_of_django.validators import ChoiceValidator, ipv4_address_validator, ipv6_address_validator, \
+    ipv46_address_validator
 
 T = TypeVar('T')
 U = TypeVar('U')
 
 T_DEFAULT = Optional[T | Callable[[], T]]
+T_VALUE = T_DEFAULT
 
 T_REGEX = str | Pattern
 T_REGEXES = (
@@ -26,6 +35,8 @@ T_REGEXES = (
 T_VALIDATORS = Iterable[Callable[[Any], Any]]
 T_DUNDER_CALL = Callable[[Optional[T]], None]
 
+T_CHOICES = tuple[T | tuple[T, T | Callable[[], T]], ...]
+
 # use this instead of 'None' when 'None' is also a valid value
 _UNDEFINED = object()
 
@@ -33,6 +44,7 @@ _UNDEFINED = object()
 _EMPTY_DICT = MappingProxyType({})
 
 
+JSON_TYPES = (str, int, float, bool, dict, list)
 T_JSON_BASIC = type[str | int | float | bool]
 T_JSON = T_JSON_BASIC | type[dict | list]
 
@@ -95,7 +107,9 @@ class BaseField:
 
         self.json_type: tuple[T_JSON] = json_type
         if self.json_type:
-            self.json_type = (self.json_type,) if isinstance(self.json_type, type) else tuple(self.json_type)
+            self.json_type = (self.json_type,) if isinstance(self.json_type, type) else tuple(set(self.json_type))
+            assert len(set(self.json_type) - set(JSON_TYPES)) == 0, \
+                   f"Valid 'json_type' values are {' | '.join([i.__class__.__name__ for i in JSON_TYPES])}"
 
         self.allow_null = allow_null
         self.required = required
@@ -106,22 +120,20 @@ class BaseField:
         # default value, can be a function with no mandatory arguments
         self.default: T_DEFAULT[Any] = default
 
-    @staticmethod
-    def to_python(json_value):
+    def to_python(self, json_value):
         """
         Converts JSON value to Python
         :raises: ValidationError: if there is an error on conversion
         """
         return json_value
 
-    @staticmethod
-    def to_json(python_value):
+    def to_json(self, python_value):
         """Converts Python value to JSON"""
         return python_value
 
-    def validate_field_base(self, value):
+    def validate_field_raw(self, value):
         """
-        Validates raw value from parsed JSON and converts it to Python value for further validation
+        Validates raw value from parsed JSON before conversion and converts it to Python value for further validation
         :raises: ValidationError: if raw field is invalid
         :return: Converted Python value
         """
@@ -140,14 +152,14 @@ class BaseField:
 
     def validate_field(self, value):
         """
-        Validates converted to python value
+        Validates converted Python value
         :raises: SerializerError: with list of exceptions if value is invalid
         :return: Converted value
         """
 
         errors = []
         try:
-            converted = self.validate_field_base(value)
+            converted = self.validate_field_raw(value)
         except ValidationError as e:
             errors.append(e)
             raise SerializerError(errors)
@@ -172,17 +184,14 @@ class Serializer(BaseField):
         'unexpected_keys': _('Object contains unexpected keys: %(unexpected_keys)s.')
     }
 
-    def __init__(self, *, instance: Model = None, data: dict = None, is_partial: bool = False, **kwargs):
+    def __init__(self, *, instance: Model = None, data: dict = None, **kwargs):
         """
         :param instance: Instance of a Django model
         :param is_partial: Specifies partial validation (e.g. for PATCH request)
         """
         assert not (kwargs and instance), "You can not use a serializer as a field with passed 'instance' to it"
         assert not (kwargs and data is not None), "You can not use a serializer as a field with passed 'data' to it"
-        assert not (data and is_partial), "It seems you wanted to partially validate data you passed as 'data' argument. " \
-                                          "If so, 'is_partial' must be passed into `.validate` method"
 
-        kwargs.pop('json_type', None)
         super().__init__(json_type=dict, **kwargs)
 
         self.instance = instance
@@ -203,7 +212,7 @@ class Serializer(BaseField):
     def validate_field(self, value: dict, is_partial: bool = False, context: dict = None) -> dict:
         """Validates serializer as a field"""
         try:
-            value = self.validate_field_base(value)
+            value = self.validate_field_raw(value)
         except ValidationError as e:
             raise SerializerError([e])
 
@@ -250,7 +259,7 @@ class Serializer(BaseField):
                 if field.default:
                     converted[field_name] = field.default() if callable(field.default) else field.default
                 elif field.required and not is_partial and not field.read_only:
-                    errors[field_name] = SerializerError([ValidationError(field.errors['required'])])
+                    errors[field_name] = SerializerError([ValidationError(field.errors['required'], code='required')])
 
         if errors:
             raise SerializerError(errors)
@@ -319,7 +328,7 @@ class Serializer(BaseField):
 
 class BooleanField(BaseField):
     def __init__(self, *, default: T_DEFAULT[bool] = _UNDEFINED, **kwargs):
-        super().__init__(**kwargs, json_type=bool, default=default)
+        super().__init__(json_type=bool, default=default, **kwargs)
 
 
 class CharField(BaseField):
@@ -327,23 +336,28 @@ class CharField(BaseField):
         **BaseField.default_errors,
         'min_length': _('Value must be at least %(min_length)s characters long.'),
         'max_length': _('Value can not exceed %(max_length)s characters.'),
-        'invalid': _('Invalid value.')
+        'invalid': _('Invalid value.'),
+        'invalid_choice': ChoiceValidator.message
     }
 
     def __init__(
             self, *, min_length: int = None, max_length: int = None, regexes: T_REGEXES = None,
-            default: T_DEFAULT[str] = _UNDEFINED, **kwargs
+            choices: T_CHOICES[str] = None, default: T_DEFAULT[str] = _UNDEFINED, **kwargs
     ):
         """
         :param min_length: minimum length of a string
         :param max_length: maximum length of a string
         :param regexes: single regular expression or list of regular expressions in form of [re1, re2, ...] or [(re1, error1), (re2, error2), ...]
+        :param choices: a tuple of strings or a tuple of two-sized tuples of strings in form of ((A, B), (C, D), ...)
         :param default:
         :param kwargs:
         """
 
-        super().__init__(**kwargs, json_type=str, default=default)
-        self.default: T_DEFAULT[str]
+        super().__init__(json_type=str, default=default, **kwargs)
+
+        assert not (any((min_length, max_length, choices, kwargs.get('validators'))) and choices), \
+               "'choices' can not be specified with 'min_length', 'max_length', 'choices' or 'validators'"
+        assert not (choices and len(choices) == 0), "'choices' must contain at least 1 choice"
 
         self.min_length = min_length
         self.max_length = max_length
@@ -379,6 +393,11 @@ class CharField(BaseField):
                         code='invalid',
                     ))
 
+        if choices:
+            if not isinstance(choices[0], str):
+                choices = tuple(i for i, _ in choices)
+            self.validators.append(ChoiceValidator(choices, message=self.errors['invalid_choice']))
+
 
 class NumericField(BaseField):
     default_errors = {
@@ -391,8 +410,8 @@ class NumericField(BaseField):
             self, *, min_value: int = None, max_value: int = None,
             default: T_DEFAULT[int] = _UNDEFINED, **kwargs
     ):
-        super().__init__(json_type=kwargs.pop('json_type', (int, float)), **kwargs, default=default)
-        self.default: T_DEFAULT[int]
+
+        super().__init__(json_type=kwargs.pop('json_type', (int, float)), default=default, **kwargs)
 
         self.min_value = min_value
         self.max_value = max_value
@@ -408,14 +427,12 @@ class NumericField(BaseField):
 
 class IntegerField(NumericField):
     def __init__(self, *, default: T_DEFAULT[int] = _UNDEFINED, **kwargs):
-        super().__init__(**kwargs, json_type=int, default=default)
-        self.default: T_DEFAULT[int]
+        super().__init__(json_type=int, default=default, **kwargs)
 
 
 class FloatField(NumericField):
     def __init__(self, *, default: T_DEFAULT[float] = _UNDEFINED, **kwargs):
-        super().__init__(**kwargs, json_type=float, default=default)
-        self.default: T_DEFAULT[float]
+        super().__init__(json_type=float, default=default, **kwargs)
 
 
 class DecimalField(NumericField):
@@ -430,7 +447,8 @@ class DecimalField(NumericField):
             self, *, max_digits: int = None, max_decimal_places: int = None,
             default: T_DEFAULT[Decimal] = _UNDEFINED, **kwargs
     ):
-        super().__init__(**kwargs, json_type=float, default=default)
+
+        super().__init__(json_type=float, default=default, **kwargs)
 
         self.max_digits = max_digits
         self.max_decimal_places = max_decimal_places
@@ -448,12 +466,10 @@ class DecimalField(NumericField):
 
             self.validators.append(dj_validators.DecimalValidator(self.max_digits, self.max_decimal_places))
 
-    @staticmethod
-    def to_json(python_value: Decimal) -> float:
+    def to_json(self, python_value: Decimal) -> float:
         return float(python_value)
 
-    @staticmethod
-    def to_python(json_value: float):
+    def to_python(self, json_value: float):
         return Decimal(json_value)
 
 
@@ -469,8 +485,15 @@ class DictField(BaseField):
             value_json_type: T_JSON | tuple[T_JSON, ...],
             default: T_DEFAULT[dict] = _UNDEFINED, **kwargs
     ):
-        super().__init__(**kwargs, json_type=dict, default=default)
-        self.default: T_DEFAULT[dict]
+        """
+        :param min_items: minimum item count in a dictionary
+        :param max_items: maximum item count in a dictionary
+        :param key_field: a CharField that would be used to validate dictionary's key
+        :param value_field: a CharField that would be used to validate dictionary's value
+        :param value_json_type: value type that is expected from values in JSON
+        """
+
+        super().__init__(json_type=dict, default=default, **kwargs)
 
         assert not (value_field and value_json_type), "'value_field' can not be combined with 'value_json_type'"
 
@@ -498,7 +521,7 @@ class DictField(BaseField):
             self.value_field = BaseField(json_type=value_json_type)
 
         assert not (self.key_field and self.key_field.allow_null), \
-            "Dict keys can not be null, edit 'allow_null' argument"
+               "Dict keys can not be null, edit 'allow_null' argument"
 
     def validate_field(self, value: dict) -> dict:
         """
@@ -506,7 +529,7 @@ class DictField(BaseField):
         :raise SerializerError:
         """
         try:
-            value: dict = self.validate_field_base(value)
+            value: dict = self.validate_field_raw(value)
         except ValidationError as e:
             raise SerializerError([e])
 
@@ -567,11 +590,18 @@ class ListField(BaseField):
             item_json_type: T_JSON_BASIC | tuple[T_JSON_BASIC, ...] = None,
             default: T_DEFAULT[list | tuple] = _UNDEFINED, **kwargs
     ):
-        super().__init__(**kwargs, json_type=list, default=default)
-        self.default: T_DEFAULT[list | tuple]
+        """
+        :param min_length: minimum length of a list
+        :param max_length: maximum length of a list
+        :param unique_items: whether list items should be validated for uniqueness
+        :param item_field: field that would be used to validate list's values
+        :param item_json_type: type of value expected from a list
+        """
+
+        super().__init__(json_type=list, default=default, **kwargs)
 
         assert not (unique_items and isinstance(item_field, (ListField, DictField, Serializer))), \
-            f"Can not combine 'unique_items' with 'item_field={item_field.__class__.__name__}', " \
+            f"Can not combine 'unique_items' with 'item_field={item_field.__class__.__name__}(...)', " \
             f"because type of an item field must be hashable"
         assert not (item_field and item_json_type), "'item_field' can not be combined with 'item_json_type'"
 
@@ -597,7 +627,7 @@ class ListField(BaseField):
         :raise SerializerError:
         """
         try:
-            value: list = self.validate_field_base(value)
+            value: list = self.validate_field_raw(value)
         except ValidationError as e:
             raise SerializerError([e])
 
@@ -638,3 +668,188 @@ class ListField(BaseField):
             raise SerializerError(errors)
 
         return converted
+
+
+class _TimesField(BaseField):
+    default_errors = {
+        **BaseField.default_errors,
+        'min_value': MinValueValidator.message,
+        'max_value': MaxValueValidator.message,
+    }
+    _parse_func = None
+
+    def __init__(self, *, min_value=None, max_value=None, default=None, **kwargs):
+        super().__init__(default=default, **kwargs)
+        if min_value:
+            self.validators.append(MinValueValidator(min_value, self.errors['min_value']))
+        if max_value:
+            self.validators.append(MaxValueValidator(max_value, self.errors['max_value']))
+
+    def to_python(self, json_value: str):
+        try:
+            item = self._parse_func(json_value)
+            if item is None:
+                raise ValueError()
+            return item
+        except ValueError:
+            raise ValidationError(self.errors['invalid'], 'invalid')
+
+
+class DateField(_TimesField):
+    default_errors = {
+        **_TimesField.default_errors,
+        'invalid': _('Invalid date.'),
+        'min_value': MinValueValidator.message,
+        'max_value': MaxValueValidator.message,
+    }
+    _parse_func = parse_date
+
+    def __init__(
+            self, *, min_value: T_VALUE[datetime.date] = None, max_value: T_VALUE[datetime.date] = None,
+            default: T_DEFAULT[datetime.date] = None, **kwargs
+    ):
+        super().__init__(min_value=min_value, max_value=max_value, default=default, **kwargs)
+
+    def to_python(self, json_value: str) -> datetime.date:
+        return super().to_python(json_value)
+
+    def to_json(self, python_value: datetime.date) -> str:
+        return python_value.isoformat()
+
+
+class TimeField(_TimesField):
+    default_errors = {
+        **_TimesField.default_errors,
+        'invalid': _('Invalid time.'),
+        'min_value': MinValueValidator.message,
+        'max_value': MaxValueValidator.message,
+    }
+    _parse_func = parse_time
+
+    def __init__(
+            self, *, min_value: T_VALUE[datetime.date] = None, max_value: T_VALUE[datetime.date] = None,
+            default: T_DEFAULT[datetime.date] = None, **kwargs
+    ):
+        super().__init__(min_value=min_value, max_value=max_value, default=default, **kwargs)
+
+    def to_python(self, json_value: str) -> datetime.time:
+        return super().to_python(json_value)
+
+    def to_json(self, python_value: datetime.time) -> str:
+        return python_value.isoformat()
+
+
+class DateTimeField(_TimesField):
+    default_errors = {
+        **_TimesField.default_errors,
+        'invalid': _('Invalid datetime.'),
+    }
+    _parse_func = parse_datetime
+
+    def __init__(
+            self, *, min_value: T_VALUE[datetime.datetime] = None, max_value: T_VALUE[datetime.datetime] = None,
+            default: T_DEFAULT[datetime.datetime] = None, **kwargs
+    ):
+        super().__init__(min_value=min_value, max_value=max_value, default=default, **kwargs)
+
+    def to_python(self, json_value: str) -> datetime.datetime:
+        return super().to_python(json_value)
+
+    def to_json(self, python_value: datetime.datetime) -> str:
+        return python_value.isoformat()
+
+
+class DurationField(_TimesField):
+    default_errors = {
+        **_TimesField.default_errors,
+        'invalid': _('Invalid duration.'),
+    }
+    _parse_func = parse_duration
+
+    def to_python(self, json_value: str) -> datetime.timedelta:
+        return super().to_python(json_value)
+
+    def to_json(self, python_value: datetime.timedelta) -> str:
+        return timedelta_to_iso8601(python_value)
+
+
+class SlugField(CharField):
+    default_errors = {
+        **CharField.default_errors,
+        'invalid': _('Invalid slug.'),
+    }
+    default_slug_regex = re.compile(r'^[a-z0-9]+(-[a-z0-9]+)*$')
+
+    def __init__(self, *, regexes: T_REGEXES = None, **kwargs):
+        if regexes is None:
+            regexes = (self.default_slug_regex,)
+        super().__init__(regexes=regexes, **kwargs)
+
+
+class URLField(CharField):
+    default_errors = {
+        **CharField.default_errors,
+        'invalid': _('Invalid URL.'),
+    }
+
+    def __init__(self, *, schemes: tuple[str] = ('http', 'https', 'ftp', 'ftps'), **kwargs):
+        """
+        :param schemes: tuple of URL schemes - 'http', 'https', 'ftp', 'ftps'
+        """
+
+        super().__init__(**kwargs)
+        self.validators.append(URLValidator(schemes=schemes))
+
+
+class UUIDField(BaseField):
+    default_errors = {
+        **BaseField.default_errors,
+        'invalid': _('Invalid UUID.')
+    }
+
+    def __init__(self, *, default: T_DEFAULT[UUID] = _UNDEFINED, **kwargs):
+        super().__init__(json_type=str, default=default, **kwargs)
+
+    def to_python(self, json_value: str) -> UUID:
+        try:
+            uuid = UUID(json_value)
+        except ValueError:
+            raise ValidationError(self.errors['invalid'], code='invalid')
+        return uuid
+
+    def to_json(self, python_value: UUID) -> str:
+        return str(python_value)
+
+
+class EmailField(CharField):
+    default_errors = {
+        **CharField.default_errors,
+        'invalid': _('Invalid email.'),
+    }
+
+    def __init__(self, *, domain_allowlist: tuple[str] = None, **kwargs):
+        super().__init__(**kwargs)
+        self.validators.append(EmailValidator(message=self.errors['invalid'], allowlist=domain_allowlist))
+
+
+class IPAddressField(BaseField):
+    default_errors = {
+        **BaseField.default_errors,
+        'invalid': _('Invalid IP address.'),
+    }
+
+    def __init__(self, *, protocol: str = 'both', **kwargs):
+        """
+        :param protocol: protocol of an IP address, either 'ipv4', 'ipv6' or 'both'
+        """
+
+        super().__init__(json_type=str, **kwargs)
+
+        self.protocol = protocol.lower()
+        assert self.protocol in ('both', 'ipv4', 'ipv6'), "Valid values for 'protocol' are 'both', 'ipv4' and 'ipv6'"
+
+        self.validators.append({
+            'ipv4': ipv4_address_validator,
+            'ipv6': ipv6_address_validator,
+            'both': ipv46_address_validator
+        }[self.protocol](self.errors['invalid']))
