@@ -1,10 +1,12 @@
+import base64
+import binascii
 import inspect
 import re
 from abc import abstractmethod
 import datetime
 from decimal import Decimal
 from types import MappingProxyType
-from typing import Pattern, Iterable, TypeVar, Callable, Any, Optional
+from typing import Pattern, Iterable, TypeVar, Callable, Any, Optional, Literal, Union
 from uuid import UUID
 
 from django.conf import settings
@@ -36,6 +38,15 @@ T_VALIDATORS = Iterable[Callable[[Any], Any]]
 T_DUNDER_CALL = Callable[[Optional[T]], None]
 
 T_CHOICES = tuple[T | tuple[T, T | Callable[[], T]], ...]
+
+T_ENCODER_PARAM = (
+    Union[Literal['base16'], Literal['base32'], Literal['base64'], Literal['base85']] |
+    Callable[[str], bytes]
+)
+T_DECODER_PARAM = (
+    Union[Literal['base16'], Literal['base32'], Literal['base64'], Literal['base85']] |
+    Callable[[bytes], str]
+)
 
 # use this instead of 'None' when 'None' is also a valid value
 _UNDEFINED = object()
@@ -184,11 +195,12 @@ class Serializer(BaseField):
         'unexpected_keys': _('Object contains unexpected keys: %(unexpected_keys)s.')
     }
 
-    def __init__(self, *, instance: Model = None, data: dict = None, **kwargs):
+    def __init__(self, *, instance: Model | dict = None, data: dict = None, **kwargs):
         """
         :param instance: Instance of a Django model
         :param is_partial: Specifies partial validation (e.g. for PATCH request)
         """
+        assert not (kwargs and instance and data), "You can not use a serializer as a field with passed 'instance' and 'data' to it"
         assert not (kwargs and instance), "You can not use a serializer as a field with passed 'instance' to it"
         assert not (kwargs and data is not None), "You can not use a serializer as a field with passed 'data' to it"
 
@@ -196,6 +208,8 @@ class Serializer(BaseField):
 
         self.instance = instance
         self.data = data
+
+        self.as_field = not any((self.instance, self.data))
 
         self._validated_data = None
 
@@ -291,7 +305,6 @@ class Serializer(BaseField):
         raise NotImplementedError(f"'validate' method is not implemented in '{self.__class__.__name__}' class.")
 
     @classmethod
-    # @cache
     def get_fields(cls) -> MappingProxyType[str, BaseField]:
         """Returns an immutable dict of fields in form of {field_name: Field}"""
         fields = inspect.getmembers(cls, lambda x: not inspect.isroutine(x) and isinstance(x, BaseField))
@@ -329,6 +342,60 @@ class Serializer(BaseField):
 class BooleanField(BaseField):
     def __init__(self, *, default: T_DEFAULT[bool] = _UNDEFINED, **kwargs):
         super().__init__(json_type=bool, default=default, **kwargs)
+
+
+class BinaryField(BaseField):
+    default_errors = {
+        **BaseField.default_errors,
+        'invalid': _('Invalid data.'),
+    }
+
+    encoders = {
+        'base16': base64.b16encode,
+        'base32': base64.b32encode,
+        'base64': base64.b64encode,
+        'base85': base64.b85encode,
+    }
+    decoders = {
+        'base16': base64.b16decode,
+        'base32': base64.b32decode,
+        'base64': base64.b64decode,
+        'base85': base64.b85decode,
+    }
+
+    def __init__(
+            self, *, decoder: T_DECODER_PARAM = 'base64', encoder: T_ENCODER_PARAM = None,
+            default: T_DEFAULT[bytes] = _UNDEFINED, **kwargs
+    ):
+        """
+        :param decoder: decoder used to decode string
+        :param encoder: encoder used to encode bytes
+        """
+        super().__init__(json_type=str, default=default, **kwargs)
+
+        if callable(decoder):
+            self.decoder = decoder
+        else:
+            assert decoder in self.decoders, f"'decoder' must be one of the following values: {' | '.join(self.decoders.keys())}"
+            self.decoder = self.decoders[decoder]
+
+        if callable(encoder):
+            self.encoder = encoder
+        elif encoder:
+            assert encoder in self.encoders, f"'encoder' must be one of the following values: {' | '.join(self.encoders.keys())}"
+            self.encoder = self.encoders[encoder]
+        else:
+            assert (not callable(decoder)), "'encoder' must be specified when 'decoder' is callable"
+            self.encoder = self.encoders[decoder]
+
+    def to_python(self, json_value: str) -> bytes:
+        try:
+            return self.decoder(json_value)
+        except (ValueError, binascii.Error):
+            raise ValidationError(message=self.errors['invalid'], code='invalid')
+
+    def to_json(self, python_value: bytes | bytearray) -> str:
+        return self.encoder(python_value)
 
 
 class CharField(BaseField):
@@ -838,9 +905,9 @@ class IPAddressField(BaseField):
         'invalid': _('Invalid IP address.'),
     }
 
-    def __init__(self, *, protocol: str = 'both', **kwargs):
+    def __init__(self, *, protocol: Union[Literal['ipv4'], Literal['ipv6'], Literal['both']] = 'both', **kwargs):
         """
-        :param protocol: protocol of an IP address, either 'ipv4', 'ipv6' or 'both'
+        :param protocol: protocol of an IP address
         """
 
         super().__init__(json_type=str, **kwargs)
